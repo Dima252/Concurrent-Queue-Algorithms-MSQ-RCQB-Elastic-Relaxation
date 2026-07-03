@@ -43,10 +43,11 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
     private static final int DEQPEND  = 3;
 
     // ── Constants ─────────────────────────────────────────────────────────────
-    // 4096 slots comfortably absorbs bursts from up to 1024 concurrent threads
-    // without filling. 256 was the paper's demo value; it deadlocks under the
-    // pure-enqueue warmup pattern used in BenchmarkMain.
-    private static final int DEFAULT_CAPACITY = 4096;  // must be power of 2
+    // 65,536 slots: under the fixed-time benchmark (seconds of 50/50 random
+    // ops) queue occupancy does a random walk whose excursions exceed 4096,
+    // and every "full" episode parks enqueuers in 1 ms sleeps, drowning the
+    // measurement in blocking noise. 256 was the paper's demo value.
+    private static final int DEFAULT_CAPACITY = 65_536;  // must be power of 2
     /** Spin iterations before a dequeuer sleeps on a free slot (paper MAXSPINS). */
     private static final int MAX_SPINS        = 1_000;
 

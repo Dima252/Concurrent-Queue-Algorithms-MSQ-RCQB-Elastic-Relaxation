@@ -1,0 +1,5 @@
+# Build output — rebuild with compile.sh (or javac, see README / Commands.txt)
+bin/
+out/
+flattened_for_server/out/
+*.class

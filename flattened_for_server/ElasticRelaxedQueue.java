@@ -39,7 +39,7 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
     // ── Tuning knobs ──────────────────────────────────────────────────────────
     private static final int    MAX_LANES       = 64;
     private static final int    MIN_LANES       = 1;
-    private static final double HIGH_THRESHOLD  = 0.25;  // expand when >30% CAS failures
+    private static final double HIGH_THRESHOLD  = 0.25;  // expand when >25% CAS failures
     private static final double LOW_THRESHOLD   = 0.05;  // contract when <5% CAS failures
     private static final long   CHECK_INTERVAL  = 2048;  // ops between elasticity samples
 

@@ -1,5 +1,26 @@
 # Concurrent Queue Algorithms: MSQ, RCQB, and Elastic Relaxation
 
+> ## 📢 Update for Moataz — July 3, 2026
+>
+> **What changed (all changes applied to both `src/` and `flattened_for_server/`):**
+> 1. **Benchmark redesigned: fixed-work → fixed-time.** Threads no longer run a fixed
+>    100k ops each; they run for a fixed 2-second window (`RUN_MILLIS`) and we count
+>    completed ops. Each configuration now runs **5 trials and reports the median**.
+>    Reason: the old design mostly measured JIT warmup and let one straggler thread
+>    stretch the clock.
+> 2. **RCQB ring enlarged 4096 → 65,536 slots.** Under a 2-second 50/50 workload the
+>    old ring filled up, parking enqueuers in 1 ms sleeps and destroying RCQB's numbers.
+> 3. **Your lane-printing (task 1) and tuning constants (0.25 / 2048) are now also in
+>    `src/`** — the two folders had drifted apart; they're back in sync.
+> 4. `bin/` and `out/` build outputs are now gitignored (compiled `.class` files were
+>    tracked in git; after pulling, rebuild with `bash compile.sh`).
+>
+> **What we need from you: re-run on the university server** (same as before —
+> `flattened_for_server/Commands.txt`) and send back the full output. The results
+> table below is preliminary (Windows laptop); the report numbers should come from
+> the server. Watch RCQB specifically: on Windows it alternates between a fast and
+> a slow regime run-to-run — we want to see if Linux smooths that out.
+
 A Java implementation and comparative study of three concurrent queue algorithms,
 developed as the final project for the **Multi-Core Programming** course.
 
@@ -75,8 +96,9 @@ array wraps), only one wins; the other spins on the current slot state.
 **Ordering:** relaxed FIFO. Items can be dequeued out of insertion order by up to
 `(N−1) × min(ke, kd−1)` positions (Theorem 1 of the paper).
 
-**Bounded buffer:** the array holds at most N items (default 256). Enqueuers block
-when all slots are full — this requires concurrent dequeuers to be running.
+**Bounded buffer:** the array holds at most N items (default 65,536; the paper's
+demo value was 256). Enqueuers block when all slots are full — this requires
+concurrent dequeuers to be running.
 
 **Java adaptations vs. the paper:**
 - `head` uses **CAS instead of FAA** so `dequeue()` can return `null` on an empty
@@ -187,86 +209,68 @@ slots with no concurrent dequeuers running causes enqueuers to block forever.
 
 ---
 
-## Benchmark Results
+## Benchmark Results (preliminary — awaiting server run)
+
+**Methodology (new):** fixed-time — every configuration runs for a 2-second
+wall-clock window and we count completed operations; each configuration is run
+**5 times and the median is reported**, with a fresh queue per trial.
+50 % enqueue / 50 % dequeue. Run `java -cp bin benchmark.BenchmarkMain` to reproduce.
 
 **Platform:** Windows 11 · AMD Ryzen 7 7800X3D (8 physical cores / 16 logical threads)
-· OpenJDK 1.8.0_482 (Eclipse Temurin) · 100,000 ops/thread · 50 % enqueue / 50 % dequeue.
-Run `java -cp bin benchmark.BenchmarkMain` to reproduce.
+· OpenJDK 1.8.0_482 (Eclipse Temurin). **Final report numbers must come from the
+university server — do not cite this table in the report.**
 
-| Threads | MSQ (M ops/s) | RCQB (M ops/s) | ERQ (M ops/s) |
-|--------:|--------------:|---------------:|--------------:|
-| 1       | 14.4          | **24.9**       | 13.5          |
-| 2       | 16.7          | **22.2**       | 7.6           |
-| 4       | 14.9          | **32.9**       | 9.7           |
-| 8       | 9.7           | **41.4**       | 20.0          |
-| 16      | 6.2           | 15.7           | **32.2**      |
-| 32      | 6.9           | 15.8           | **21.1**      |
+| Threads | MSQ (M ops/s) | RCQB (M ops/s) | ERQ (M ops/s) | ERQ max→final K |
+|--------:|--------------:|---------------:|--------------:|:---------------|
+| 1       | 83.3          | **85.2**       | 45.6          | 1 → 1          |
+| 2       | 21.0          | **28.1**       | 14.7          | 1 → 1          |
+| 4       | 13.2          | **31.0**       | 12.9          | 2 → 1          |
+| 8       | 8.5           | **26.3**       | 21.0          | 3 → 2          |
+| 16      | 6.0           | 16.4           | **31.5**      | 6 → 5          |
+| 32      | 5.9           | **66.5**       | 32.7          | 6 → 6          |
+| 64      | 5.9           | 15.2           | **29.7**      | 6 → 5          |
+| 128     | 5.9           | **67.3**       | 26.1          | —              |
+| 256     | 5.9           | **50.6**       | 29.2          | —              |
+| 512     | 5.9           | **68.1**       | 15.3          | —              |
+| 1024    | 5.8           | **52.5**       | 18.8          | —              |
 
-*All values in M ops/sec. Bold = winner at that thread count.
-Measured up to 32 threads — beyond that, RCQB's blocking sleep/wake mechanism
-becomes increasingly slow under Windows thread scheduling at 4× oversubscription.*
+**What the numbers show so far:**
 
-**What the numbers prove:**
+- **MSQ is the textbook baseline:** dead-flat ~5.9 M ops/s from 16 to 1024 threads.
+  All threads compete on one `tail` CAS, so total throughput equals one CAS
+  round-trip's worth of work regardless of thread count.
 
-- **MSQ degrades steadily.** Throughput drops from ~15 M/s at 1 thread to ~7 M/s
-  at 32 threads and stays there. Every enqueuer fights over the same single `tail`
-  CAS; one wins per round, the rest retry.
+- **ERQ is the stable scaler:** 26–33 M ops/s (≈5× MSQ) from 16 through 256 threads,
+  with the elasticity controller expanding K from 1 to 6 exactly when contention
+  rises — confirming the adaptive mechanism fires. Degrades gracefully at extreme
+  oversubscription (still 3× MSQ at 1024 threads). Reproducible run-to-run.
 
-- **RCQB peaks at 8 threads (41.4 M/s — 4× faster than MSQ).** The FAA slot
-  assignment is contention-free by design: no CAS, no failure possible. The sharp
-  drop at 16 threads is because RCQB is a *blocking* algorithm — dequeuers that
-  find an empty slot sleep for up to 1 ms. Once threads outnumber physical cores
-  (8 cores on this machine), wake-up latency accumulates and throughput collapses.
-  This is exactly the trade-off the Kappes paper warns about for blocking algorithms
-  on oversubscribed systems (§3, §7.2).
-
-- **ERQ overtakes RCQB at 16 threads (32.2 vs 15.7 M/s) and stays ahead.** ERQ is
-  fully lock-free — no sleeping, no wake-up cost. By 16 threads the elasticity
-  controller has expanded K to multiple lanes, spreading CAS pressure across them.
-
-- **Crossover point (ERQ beats MSQ): 8 threads (20.0 vs 9.7 M/s).**
-  RCQB beats MSQ from thread 1 because the pre-allocated array eliminates
-  `new Node()` heap allocation on every enqueue.
+- **RCQB is fast but erratic on Windows:** it alternates between a ~15–30 M and a
+  ~66 M regime with no pattern by thread count, even with median-of-5. Working
+  hypothesis: whole runs fall into (or avoid) the 1 ms sleep/wake path of its
+  blocking design depending on early queue-occupancy drift — the oversubscription
+  sensitivity the Kappes paper warns about for blocking algorithms (§3, §7.2).
+  The server run should confirm or rule this out.
 
 ---
 
-## What Remains To Be Done (MOATAZ)
+## What Remains To Be Done
 
-### 1 · Print K during the benchmark (Priority: High)
+### 1 · Print K during the benchmark — ✅ DONE
+Both mains ([BenchmarkMain.java](src/benchmark/BenchmarkMain.java) and
+`flattened_for_server/MppRunner.java`) print `Max Lanes Opened` and `Final Lanes`
+for ERQ after every configuration. Confirmed working: K=1 at 1–2 threads,
+expanding to 6 at 16+ threads.
 
-The report needs to show that the elastic mechanism actually fires.
-Refactor `runBenchmark` in [BenchmarkMain.java](src/benchmark/BenchmarkMain.java)
-to accept a pre-created queue instance so you can inspect it after the run:
-
-```java
-ElasticRelaxedQueue<Integer> erq = new ElasticRelaxedQueue<>();
-System.out.println(runBenchmark("ERQ ", erq, n));
-System.out.printf("      final K=%d  failRate=%.1f%%%n",
-        erq.getActiveLanes(), erq.getFailureRate() * 100);
-```
-
-Expected: K=1 at 1–4 threads, growing toward 8–20 at 32+ threads.
-
-#### DONE
-But instead of printing the final K, I'm printing the final K and the maximum K that was used. The Changes were donr in the Elastic Queue class, and the Main Benchmark file.
-
-### 2 · Tune constants for the university server (Priority: High)
-
-The values in [ElasticRelaxedQueue.java](src/queue/ElasticRelaxedQueue.java) were
-chosen on a laptop. On the server adjust and re-run:
-
-| Constant | Current | Try first |
-|---|---|---|
-| `HIGH_THRESHOLD` | `0.30` | `0.20` — expand sooner |
-| `CHECK_INTERVAL` | `1024` | `512` — react faster |
-| `MAX_LANES` | `64` | Physical core count of the server |
-
-#### Not Done yet 
-I flattened the folder so we could be able to run it on the server, and renamed the main benchmark file to MppRunner because it is what we are currently checking on the server. I ran some tests. with 0.2 max threshold and 512 interval the results were bad. The server fell down so i stopped.
+### 2 · Run the new benchmark on the university server (Priority: High — MOATAZ)
+Same procedure as before (`flattened_for_server/Commands.txt`), now with the
+fixed-time median-of-5 methodology. Bring back the full output. Current tuning
+constants (`HIGH_THRESHOLD=0.25`, `CHECK_INTERVAL=2048`) are in both folders;
+earlier server attempt with 0.20/512 performed badly. If tuning further, consider
+`MAX_LANES` = physical core count of the server.
 
 ### 3 · Write the report analysis section (Priority: High)
-
-Minimum required content:
+Minimum required content (using **server** numbers):
 
 - Throughput table: MSQ / RCQB / ERQ at every thread count from the benchmark.
 - Crossover point: the first thread count where ERQ beats MSQ.
@@ -279,8 +283,8 @@ Minimum required content:
   is local to one slot at a time.
 - Explain why ERQ scales: CAS pressure is spread over K lanes; K auto-adjusts so
   the queue pays for exactly as much parallelism as the current load requires.
-
-#### Not Done yet
+- Address RCQB's run-to-run variance under oversubscription (blocking sleep/wake
+  vs ERQ's lock-free stability) — see the results section above.
 
 ---
 
