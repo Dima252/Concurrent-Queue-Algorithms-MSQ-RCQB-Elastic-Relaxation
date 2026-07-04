@@ -68,6 +68,15 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
     // into. LongAdder, touched only on the sleep path — hot path unaffected.
     private final LongAdder deqSleepWaits = new LongAdder();
 
+    // Counts FAILED CAS attempts on head (a dequeuer that lost the race for a
+    // slot index and had to retry). This is the direct test of the leading
+    // bimodality hypothesis: the slow regime ≈ MSQ's single-contended-CAS
+    // ceiling (~4-6 M ops/s), and RCQB's dequeue uses CAS-on-head (OUR
+    // totalization adaptation; the paper uses uncontended FAA). If slow trials
+    // show orders of magnitude more head-CAS failures than fast ones, the slow
+    // regime is our head CAS piling up exactly like MSQ's tail.
+    private final LongAdder headCasFails = new LongAdder();
+
     // ── Construction ─────────────────────────────────────────────────────────
 
     public RCQBQueue(int capacity) {
@@ -117,7 +126,10 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
             int h = head.get();
             int t = tail.get();
             if (t - h <= 0) return null;              // queue is empty
-            if (!head.compareAndSet(h, h + 1)) continue; // lost race, retry
+            if (!head.compareAndSet(h, h + 1)) {      // lost race, retry
+                headCasFails.increment();             // diagnostic
+                continue;
+            }
 
             // Stage 1 — deq_assign succeeded: we own slot locHead
             int  locHead = h & mask;
@@ -184,6 +196,9 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
 
     /** Total wait(1) calls by sleeping dequeuers ≈ ms spent asleep. */
     public long getDequeueSleepWaits() { return deqSleepWaits.sum(); }
+
+    /** Total failed CAS attempts on head (dequeue-side contention). */
+    public long getHeadCasFails() { return headCasFails.sum(); }
 
     /** Current item count (tail may be read slightly stale; clamped to 0). */
     public int occupancy() { return Math.max(0, tail.get() - head.get()); }

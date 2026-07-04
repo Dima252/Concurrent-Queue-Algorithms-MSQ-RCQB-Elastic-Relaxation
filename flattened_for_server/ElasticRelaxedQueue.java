@@ -1,6 +1,7 @@
 
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Elastic Relaxed Queue (ERQ).
@@ -61,14 +62,18 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
     private final AtomicInteger scanHighWater = new AtomicInteger(MIN_LANES);
     private final ContentionMonitor monitor   = new ContentionMonitor();
 
-    // Separate counters prevent a single shared counter from becoming a new bottleneck.
-    private final AtomicLong enqCounter = new AtomicLong(0);
-    private final AtomicLong deqCounter = new AtomicLong(0);
     // Per-thread op count for elasticity sampling. Replaces a global AtomicLong
     // that was an FAA hot-spot on EVERY operation — the reason ERQ used to run
     // at less than half of MSQ's single-thread speed.
     private final ThreadLocal<int[]> opsSinceCheck =
             ThreadLocal.withInitial(() -> new int[1]);
+
+    // Diagnostics (report evidence, not part of the algorithm): total dequeue
+    // calls and total lanes scanned across them, so we can report the mean scan
+    // depth per dequeue. If the queue is not near-empty this stays close to 1
+    // and the O(K) scan is a non-issue; if it climbs with K it is a real cost.
+    private final LongAdder deqCalls    = new LongAdder();
+    private final LongAdder lanesProbed = new LongAdder();
 
     public ElasticRelaxedQueue() {
         for (int i = 0; i < MAX_LANES; i++) lanes[i] = new Lane<>();
@@ -79,20 +84,18 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
     @Override
     public void enqueue(T value) {
         while (true) {
-            int k   = activeLanes.get();
-            // K=1 fast path: lane 0 is the only choice, and the shared FAA
-            // would reintroduce an MSQ-style hot-spot exactly when ERQ is
-            // supposed to behave like a plain MS queue.
-            // K>1: round-robin via getAndIncrement — each concurrent caller
-            // gets a distinct starting index.
-            int idx = (k == 1) ? 0 : (int)(enqCounter.getAndIncrement() % k);
+            int k = activeLanes.get();
+            // K=1 fast path: lane 0 is the only choice. K>1: pick a lane with
+            // ThreadLocalRandom, NOT a shared getAndIncrement. The old shared
+            // counter was a contended FAA on every enqueue — a fresh single
+            // hot-spot that re-created the exact MSQ bottleneck ERQ exists to
+            // spread. A random index spreads load just as well with zero shared
+            // state, and on a CAS collision the next iteration simply re-draws.
+            int idx = (k == 1) ? 0 : ThreadLocalRandom.current().nextInt(k);
             if (lanes[idx].tryEnqueue(value, monitor)) {
                 maybeAdjustK();
                 return;
             }
-            // tryEnqueue returned false: a CAS collision was observed.
-            // enqCounter was already incremented, so the next loop iteration
-            // will pick a different lane — naturally spreading the retry load.
         }
     }
 
@@ -101,15 +104,19 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
         // Use the high-watermark, not activeLanes, so we never skip a lane
         // that had an item written to it just before K contracted.
         int k     = scanHighWater.get();
-        // Same K=1 fast path as enqueue: skip the shared counter.
-        int start = (k == 1) ? 0 : (int)(deqCounter.getAndIncrement() % k);
+        // Random start (K>1), same reasoning as enqueue: no shared counter.
+        int start = (k == 1) ? 0 : ThreadLocalRandom.current().nextInt(k);
         for (int i = 0; i < k; i++) {
             T val = lanes[(start + i) % k].tryDequeue(monitor);
             if (val != null) {
+                deqCalls.increment();
+                lanesProbed.add(i + 1);   // lanes touched before finding an item
                 maybeAdjustK();
                 return val;
             }
         }
+        deqCalls.increment();
+        lanesProbed.add(k);               // scanned all k, found nothing
         return null; // all lanes empty
     }
 
@@ -164,4 +171,10 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
 
     /** Snapshot of the current CAS failure rate [0.0, 1.0]. */
     public double getFailureRate() { return monitor.getFailureRate(); }
+
+    /** Mean lanes touched per dequeue call. ~1 = O(1); near K = O(K) scan cost. */
+    public double getAvgScanDepth() {
+        long calls = deqCalls.sum();
+        return calls == 0 ? 0.0 : (double) lanesProbed.sum() / calls;
+    }
 }

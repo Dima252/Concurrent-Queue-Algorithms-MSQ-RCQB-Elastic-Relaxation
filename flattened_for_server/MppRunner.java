@@ -44,28 +44,29 @@ public final class MppRunner {
         for (int n : THREAD_COUNTS) {
             report(runTrials("MSQ ", MichaelScottQueue<Integer>::new, n));
 
-            // RCQB: print every trial's throughput next to its sleep time and
-            // mean occupancy. This discriminates the two candidate causes of
-            // RCQB's bimodal throughput: ms lost sleeping vs. which occupancy
-            // mode (near-empty fast handoff / loaded state machine) the trial
-            // locked into.
+            // RCQB: per trial, throughput / sleep-ms / mean occupancy / failed
+            // head-CAS count. The head-CAS column tests the bimodality
+            // mechanism directly — the slow regime should show far more head
+            // contention than the fast regime.
             Trial[] rcqbTrials = runTrials("RCQB", RCQBQueue<Integer>::new, n);
             report(rcqbTrials);
             StringBuilder diag = new StringBuilder(
-                    "      +-- [RCQB] per-trial Mops/sleep-ms/avg-occ (sorted): ");
+                    "      +-- [RCQB] per-trial Mops/sleep-ms/avg-occ/headCASfail (sorted): ");
             for (Trial t : rcqbTrials) {
-                diag.append(String.format("%.1f/%,d/%,d  ",
+                diag.append(String.format("%.1f/%,d/%,d/%,d  ",
                         t.result.throughputMops,
                         ((RCQBQueue<Integer>) t.queue).getDequeueSleepWaits(),
-                        t.avgOccupancy));
+                        t.avgOccupancy,
+                        ((RCQBQueue<Integer>) t.queue).getHeadCasFails()));
             }
             System.out.println(diag);
 
             Trial erqTrial = report(runTrials("ERQ ", ElasticRelaxedQueue<Integer>::new, n));
             ElasticRelaxedQueue<Integer> erq = (ElasticRelaxedQueue<Integer>) erqTrial.queue;
-            System.out.printf("      +-- [ERQ] Max Lanes Opened: %d | Final Lanes: %d%n",
+            System.out.printf("      +-- [ERQ] Max Lanes Opened: %d | Final Lanes: %d | Avg Scan Depth: %.2f%n",
                 erq.getMaxLanesReached(),
-                erq.getActiveLanes());
+                erq.getActiveLanes(),
+                erq.getAvgScanDepth());
 
             System.out.println();
         }
