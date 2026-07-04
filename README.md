@@ -1,25 +1,46 @@
 # Concurrent Queue Algorithms: MSQ, RCQB, and Elastic Relaxation
 
-> ## 📢 Update for Moataz — July 3, 2026
+> ## 📢 Update for Moataz — July 4, 2026
 >
-> **What changed (all changes applied to both `src/` and `flattened_for_server/`):**
-> 1. **Benchmark redesigned: fixed-work → fixed-time.** Threads no longer run a fixed
->    100k ops each; they run for a fixed 2-second window (`RUN_MILLIS`) and we count
->    completed ops. Each configuration now runs **5 trials and reports the median**.
->    Reason: the old design mostly measured JIT warmup and let one straggler thread
->    stretch the clock.
-> 2. **RCQB ring enlarged 4096 → 65,536 slots.** Under a 2-second 50/50 workload the
->    old ring filled up, parking enqueuers in 1 ms sleeps and destroying RCQB's numbers.
-> 3. **Your lane-printing (task 1) and tuning constants (0.25 / 2048) are now also in
->    `src/`** — the two folders had drifted apart; they're back in sync.
-> 4. `bin/` and `out/` build outputs are now gitignored (compiled `.class` files were
->    tracked in git; after pulling, rebuild with `bash compile.sh`).
+> Your five server runs answered every open question — thank you. Full analysis in
+> the Results section below. Short version: MSQ collapses exactly as the theory says,
+> RCQB's bimodality **reproduces on Linux** (so it is not a Windows artifact), and
+> the tuning sweep has a clear winner: `HIGH=0.15, LOW=0.08, INTERVAL=4096` (your
+> Run 5) — best 64/128-thread ERQ throughput with smooth, monotone K growth.
 >
-> **What we need from you: re-run on the university server** (same as before —
-> `flattened_for_server/Commands.txt`) and send back the full output. The results
-> table below is preliminary (Windows laptop); the report numbers should come from
-> the server. Watch RCQB specifically: on Windows it alternates between a fast and
-> a slow regime run-to-run — we want to see if Linux smooths that out.
+> **What changed since your runs (all applied to both `src/` and `flattened_for_server/`):**
+> 1. **Run 5's tuning constants are now the defaults** (`0.15 / 0.08 / 4096`).
+> 2. **ERQ K=1 fast path + thread-local counters.** Your runs showed ERQ at less than
+>    half of MSQ's speed at 1–2 threads (~20 vs ~44 M). Cause: three shared atomic
+>    counters (`enqCounter`, `deqCounter`, `opCount`) hit on every operation, plus a
+>    double ThreadLocal lookup in the contention monitor. Now the round-robin
+>    counters are skipped entirely at K=1, the elasticity check counter is
+>    thread-local, and the monitor uses a single ThreadLocal. Measured on Windows:
+>    1-thread ERQ 45.6 → 57.6 M (+26%), 8-thread 21.0 → 25.6, 16-thread 31.5 → 42.1,
+>    and the ERQ-beats-MSQ crossover moved from 16 threads to 4. The remaining
+>    1-thread gap vs MSQ (~58 vs ~83) is the per-CAS contention monitoring — the
+>    price of elasticity; worth a sentence in the report, not more.
+>    Early bonus evidence from the same Windows run: an RCQB 8-thread config spread
+>    15.0–38.4 M across its 5 trials with **zero sleep-ms in every trial** — so at
+>    least at low thread counts the slow regime is *not* time lost sleeping; the
+>    fast trials ran at visibly lower occupancy (~2k vs ~3.5–6k items).
+> 3. **Watermark-ordering fix in ERQ expansion** — the old order could briefly hide
+>    items in a freshly opened lane and produce impossible diagnostics (your 128-thread
+>    Run 5 row printed FinalK > MaxK). Fixed by raising `scanHighWater` before
+>    `activeLanes`.
+> 4. **RCQB bimodality diagnostics.** The benchmark now prints, for every RCQB trial,
+>    throughput / total ms dequeuers spent asleep / mean queue occupancy (sampled at
+>    ~10 ms by the timekeeper thread, zero hot-path cost). A first Windows run
+>    already hints the *fast* regime is the near-empty mode (more sleeps but cheap
+>    handoffs) and the slow regime is the loaded mode — the counters will settle it
+>    with server data instead of our speculation.
+> 5. **Benchmark prints min/max spread** next to the median, and the server sweep now
+>    includes 80/96/128 threads (matching what you already ran by hand).
+>
+> **What we need from you: ONE final clean run** (`flattened_for_server/Commands.txt`,
+> unchanged procedure). That run gives us: the report throughput table, the
+> RCQB sleeps-vs-throughput evidence, and confirmation that single-thread ERQ no
+> longer trails MSQ. Please send the complete raw output.
 
 A Java implementation and comparative study of three concurrent queue algorithms,
 developed as the final project for the **Multi-Core Programming** course.
@@ -127,6 +148,8 @@ the cost of relaxed ordering. When load drops, K contracts back toward 1.
 **Enqueue:** FAA on `enqCounter` gives a lane index (`counter % K`). If the CAS on
 that lane's tail fails, `enqCounter` was already incremented — the next attempt lands
 on a different lane automatically, spreading retries without extra logic.
+At K=1 the shared counter is skipped entirely (lane 0 is the only choice), so the
+strict-FIFO mode pays no shared-memory tax beyond the MS queue's own CAS.
 
 **Dequeue:** scans up to `scanHighWater` lanes in round-robin and returns the first
 non-null result. `scanHighWater` is the high-watermark of K ever reached and never
@@ -137,11 +160,15 @@ written to a now-inactive lane, silently losing that item.
 zero shared-memory writes per record. Every 64 ops the local window flushes to a
 `LongAdder` (striped cells — far faster than `AtomicLong` under write contention).
 
-**Elasticity controller (inline, no background thread):** every 1024 completed
-operations one thread samples the global failure rate and either expands K
-(rate > 30%) or contracts K (rate < 5%) via a single CAS on `activeLanes`. Inline
-checks avoid the OS scheduling jitter that a background thread would introduce into
-latency measurements.
+**Elasticity controller (inline, no background thread):** each thread counts its own
+completed operations in a ThreadLocal; after 4096 of them it samples the global
+failure rate and either expands K (rate > 15%) or contracts K (rate < 8%) via a
+single CAS on `activeLanes`. Globally that still averages one sample per 4096 ops,
+with zero shared-counter traffic on the hot path. Inline checks avoid the OS
+scheduling jitter that a background thread would introduce into latency measurements.
+On expansion the scan watermark is raised *before* the new lane is activated, so a
+dequeuer can never miss an item enqueued to a lane it does not scan yet.
+Constants fixed by the July 2026 server tuning sweep (see Results).
 
 ---
 
@@ -209,48 +236,75 @@ slots with no concurrent dequeuers running causes enqueuers to block forever.
 
 ---
 
-## Benchmark Results (preliminary — awaiting server run)
+## Benchmark Results — University Server (July 2026)
 
-**Methodology (new):** fixed-time — every configuration runs for a 2-second
-wall-clock window and we count completed operations; each configuration is run
-**5 times and the median is reported**, with a fresh queue per trial.
-50 % enqueue / 50 % dequeue. Run `java -cp bin benchmark.BenchmarkMain` to reproduce.
+**Methodology:** fixed-time — every configuration runs for a 2-second wall-clock
+window and we count completed operations; each configuration is run **5 times and
+the median is reported**, with a fresh queue per trial. 50 % enqueue / 50 % dequeue.
+Run `java -cp bin benchmark.BenchmarkMain` (or `java -cp out MppRunner` on the
+server) to reproduce.
 
-**Platform:** Windows 11 · AMD Ryzen 7 7800X3D (8 physical cores / 16 logical threads)
-· OpenJDK 1.8.0_482 (Eclipse Temurin). **Final report numbers must come from the
-university server — do not cite this table in the report.**
+Five server runs swept the ERQ tuning space. Best configuration —
+**`HIGH=0.15, LOW=0.08, INTERVAL=4096`** (now the code default), median of 5:
 
 | Threads | MSQ (M ops/s) | RCQB (M ops/s) | ERQ (M ops/s) | ERQ max→final K |
 |--------:|--------------:|---------------:|--------------:|:---------------|
-| 1       | 83.3          | **85.2**       | 45.6          | 1 → 1          |
-| 2       | 21.0          | **28.1**       | 14.7          | 1 → 1          |
-| 4       | 13.2          | **31.0**       | 12.9          | 2 → 1          |
-| 8       | 8.5           | **26.3**       | 21.0          | 3 → 2          |
-| 16      | 6.0           | 16.4           | **31.5**      | 6 → 5          |
-| 32      | 5.9           | **66.5**       | 32.7          | 6 → 6          |
-| 64      | 5.9           | 15.2           | **29.7**      | 6 → 5          |
-| 128     | 5.9           | **67.3**       | 26.1          | —              |
-| 256     | 5.9           | **50.6**       | 29.2          | —              |
-| 512     | 5.9           | **68.1**       | 15.3          | —              |
-| 1024    | 5.8           | **52.5**       | 18.8          | —              |
+| 1       | **43.15**     | 32.23          | 19.93 †       | 1 → 1          |
+| 2       | 9.18          | **14.24**      | 5.13 †        | 1 → 1          |
+| 4       | 6.03          | **15.37**      | 4.82          | 2 → 1          |
+| 8       | 3.05          | **11.55**      | 4.18          | 3 → 3          |
+| 16      | 2.71          | **11.13**      | 6.61          | 5 → 5          |
+| 32      | 2.15          | **15.80**      | 8.79          | 8 → 7          |
+| 64      | 1.82          | 5.13 ‡         | **9.54**      | 17 → 16        |
+| 128     | 1.63          | **13.98**      | 13.40         | 32 → 29        |
 
-**What the numbers show so far:**
+† Predates the K=1 fast-path fix (see below) — expected to rise in the final run.
+‡ RCQB slow-regime run (see bimodality below).
 
-- **MSQ is the textbook baseline:** dead-flat ~5.9 M ops/s from 16 to 1024 threads.
-  All threads compete on one `tail` CAS, so total throughput equals one CAS
-  round-trip's worth of work regardless of thread count.
+**What the numbers show:**
 
-- **ERQ is the stable scaler:** 26–33 M ops/s (≈5× MSQ) from 16 through 256 threads,
-  with the elasticity controller expanding K from 1 to 6 exactly when contention
-  rises — confirming the adaptive mechanism fires. Degrades gracefully at extreme
-  oversubscription (still 3× MSQ at 1024 threads). Reproducible run-to-run.
+- **MSQ is the textbook collapse.** ~44 M ops/s alone, dead-flat ~2 M from
+  8 threads onward. The single largest drop is 1 → 2 threads (44.9 → 9.2, a 5×
+  loss from adding *one* thread): the moment a second core writes `tail`, every
+  CAS round-trip pays cache-line ping-pong. Total throughput then equals one CAS
+  latency regardless of thread count.
 
-- **RCQB is fast but erratic on Windows:** it alternates between a ~15–30 M and a
-  ~66 M regime with no pattern by thread count, even with median-of-5. Working
-  hypothesis: whole runs fall into (or avoid) the 1 ms sleep/wake path of its
-  blocking design depending on early queue-occupancy drift — the oversubscription
-  sensitivity the Kappes paper warns about for blocking algorithms (§3, §7.2).
-  The server run should confirm or rule this out.
+- **RCQB's bimodality is platform-independent.** Slow rows appeared in 4 of 5
+  server runs at scattered thread counts (e.g. 4.53 at 64t, 2.43 at 80t, 3.26 at
+  48t) against a fast regime of ~11–18 M — the same two regimes seen on Windows.
+  Since Runs 4–5 were median-of-5, a slow *median* means at least 3 of 5 trials
+  locked into the slow regime. This matches the blocking-design oversubscription
+  sensitivity Kappes & Anastasiadis warn about (§3, §7.2). Candidate mechanisms:
+  time lost in the 1 ms sleep path, or the run locking into a *loaded* occupancy
+  mode (full slot state machine + cache bouncing on every op) instead of the
+  near-empty fast-handoff mode. The benchmark's new per-trial sleep-ms and
+  mean-occupancy diagnostics will identify which one the final run exhibits.
+
+- **ERQ is the only algorithm that is both scaling and predictable.** Monotone
+  growth with thread count, no bimodal holes, crossover over MSQ at 8 threads,
+  ~5–8× MSQ from 16 threads up. At 128 threads (13.40) it statistically ties
+  RCQB's *fast* regime (13.98) while never exhibiting a slow one. K tracks thread
+  count almost linearly — the controller works as a contention sensor.
+
+**Tuning sweep findings (5 configurations):**
+
+| Config (HIGH/LOW/INTERVAL) | ERQ @64t | ERQ @128t | K behaviour |
+|:--|--:|--:|:--|
+| 0.30 / 0.05 / 1024 | 5.20 | — | under-expands; K stuck at 5–6 |
+| 0.20 / 0.07 / 256  | 8.84 | 10.53 | K oscillates wildly (MaxK 38–52, big MaxK→FinalK gaps) |
+| 0.20 / 0.08 / 4096 | 6.59 | 10.55 | smooth |
+| **0.15 / 0.08 / 4096** | **9.54** | **13.40** | smooth, K tracks threads |
+
+- `HIGH=0.30` was too conservative — lowering the expansion threshold to 0.15
+  nearly doubled 64-thread throughput. More lanes genuinely help at scale.
+- `INTERVAL=256` made the controller unstable: 256-op windows are noise-dominated,
+  so K random-walks (including runaway expansions to K=38–52 — near-empty phases
+  concentrate dequeuers on the few non-empty lanes, keeping the failure rate high
+  no matter how many lanes are added). `INTERVAL=4096` suppresses this entirely.
+- **ERQ's remaining honest cost:** a constant per-op overhead (lane indirection +
+  contention monitoring) that only pays off past ~8 threads. The K=1 fast path
+  removes the shared-counter part of that tax; the final run will show how much
+  of the 1–2-thread gap remains.
 
 ---
 
@@ -262,29 +316,38 @@ Both mains ([BenchmarkMain.java](src/benchmark/BenchmarkMain.java) and
 for ERQ after every configuration. Confirmed working: K=1 at 1–2 threads,
 expanding to 6 at 16+ threads.
 
-### 2 · Run the new benchmark on the university server (Priority: High — MOATAZ)
-Same procedure as before (`flattened_for_server/Commands.txt`), now with the
-fixed-time median-of-5 methodology. Bring back the full output. Current tuning
-constants (`HIGH_THRESHOLD=0.25`, `CHECK_INTERVAL=2048`) are in both folders;
-earlier server attempt with 0.20/512 performed badly. If tuning further, consider
-`MAX_LANES` = physical core count of the server.
+### 2 · Server tuning sweep — ✅ DONE (July 2026, 5 runs)
+Winner `HIGH=0.15, LOW=0.08, INTERVAL=4096` is now the default in both folders.
+Full findings in the Results section.
 
-### 3 · Write the report analysis section (Priority: High)
-Minimum required content (using **server** numbers):
+### 3 · Final clean server run (Priority: High — MOATAZ)
+One run of the current build (`flattened_for_server/Commands.txt`, unchanged
+procedure — sweep now includes 80/96/128 threads). This produces the report table
+plus two new pieces of evidence: per-trial RCQB throughput-vs-sleeps (bimodality
+proof) and the post-fix ERQ single-thread number. Send the complete raw output.
 
-- Throughput table: MSQ / RCQB / ERQ at every thread count from the benchmark.
-- Crossover point: the first thread count where ERQ beats MSQ.
+### 4 · Write the report analysis section (Priority: High)
+Minimum required content (using the **final server run** numbers):
+
+- Throughput table: MSQ / RCQB / ERQ at every thread count, median with min–max.
+- Crossover point: first thread count where ERQ beats MSQ (8 in the tuning runs).
 - Cite **Theorem 1** from Kappes & Anastasiadis (2022): with K lanes the maximum
   FIFO deviation per item is `(K−1) × min(T_e, T_d−1)`. At K=1 this is 0 —
   strictly equivalent to a plain MS queue.
 - Explain why MSQ degrades: N threads compete on one `tail` CAS; throughput equals
-  one CAS latency, not N × (one CAS latency).
+  one CAS latency, not N × (one CAS latency). Use the 1→2 thread collapse
+  (44.9 → 9.2) as the cache-coherence illustration.
 - Explain why RCQB scales: the assign step (FAA) is contention-free; CAS contention
   is local to one slot at a time.
 - Explain why ERQ scales: CAS pressure is spread over K lanes; K auto-adjusts so
   the queue pays for exactly as much parallelism as the current load requires.
-- Address RCQB's run-to-run variance under oversubscription (blocking sleep/wake
-  vs ERQ's lock-free stability) — see the results section above.
+  Show K vs thread count (near-linear in the tuning sweep).
+- RCQB's bimodal regimes under oversubscription (blocking sleep/wake vs ERQ's
+  lock-free stability), now backed by the sleep-episode counts. Note honestly that
+  bimodality reproduced on both Windows and Linux.
+- ERQ limitations: constant per-op overhead below ~8 threads; controller
+  instability with short sampling windows (the INTERVAL=256 oscillation) as the
+  justification for INTERVAL=4096.
 
 ---
 

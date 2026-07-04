@@ -16,13 +16,12 @@ public final class ContentionMonitor {
 
     private static final int FLUSH_INTERVAL = 64;
 
-    // Index 0 = successes, index 1 = failures (thread-local pending flush)
+    // Index 0 = successes, index 1 = failures, index 2 = ops since last flush.
+    // One array in ONE ThreadLocal: record() runs on the hot path of every CAS,
+    // and a ThreadLocal lookup is its dominant cost — two lookups (the previous
+    // design kept the flush counter in a separate ThreadLocal) doubled it.
     private final ThreadLocal<long[]> localWindow =
-            ThreadLocal.withInitial(() -> new long[2]);
-
-    // Counts operations since last flush for this thread
-    private final ThreadLocal<int[]> opsSinceFlush =
-            ThreadLocal.withInitial(() -> new int[1]);
+            ThreadLocal.withInitial(() -> new long[3]);
 
     // Global aggregates — LongAdder outperforms AtomicLong under high write contention
     private final LongAdder globalSuccesses = new LongAdder();
@@ -32,14 +31,12 @@ public final class ContentionMonitor {
     public void recordFailure()  { record(1); }
 
     private void record(int idx) {
-        long[] w   = localWindow.get();
-        int[]  cnt = opsSinceFlush.get();
+        long[] w = localWindow.get();
         w[idx]++;
-        if (++cnt[0] >= FLUSH_INTERVAL) {
+        if (++w[2] >= FLUSH_INTERVAL) {
             globalSuccesses.add(w[0]);
             globalFailures.add(w[1]);
-            w[0] = w[1] = 0;
-            cnt[0] = 0;
+            w[0] = w[1] = w[2] = 0;
         }
     }
 

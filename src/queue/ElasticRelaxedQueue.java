@@ -19,14 +19,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ul>
  *
  * <h2>Elasticity</h2>
- * After every {@code CHECK_INTERVAL} completed operations, one thread samples
- * the global CAS failure rate from the {@link ContentionMonitor}:
+ * Each thread counts its own completed operations in a ThreadLocal; after
+ * {@code CHECK_INTERVAL} of them it samples the global CAS failure rate from
+ * the {@link ContentionMonitor}. Globally this still averages one sample per
+ * CHECK_INTERVAL operations, but costs zero shared-memory traffic per op —
+ * a single global op counter here would itself be a contended FAA on every
+ * operation, re-creating the very bottleneck ERQ exists to remove.
  * <ul>
  *   <li>Rate &gt; {@code HIGH_THRESHOLD} → expand K by 1 (up to {@code MAX_LANES}).</li>
  *   <li>Rate &lt; {@code LOW_THRESHOLD}  → contract K by 1 (down to 1).</li>
  * </ul>
- * The adjustment uses a single CAS on {@code activeLanes}, so at most one thread
- * changes K per sampling window even under high concurrency.
+ * The adjustment uses a single CAS on {@code activeLanes}, so concurrent
+ * samplers cannot stampede K in one step.
  *
  * <h2>Relaxation bound</h2>
  * Analogous to Kappes & Anastasiadis (2022) Theorem 1: with K lanes and T
@@ -37,11 +41,16 @@ import java.util.concurrent.atomic.AtomicLong;
 public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
 
     // ── Tuning knobs ──────────────────────────────────────────────────────────
+    // Values fixed by the 2026-07 server tuning sweep (5 configurations):
+    // 0.30/1024 under-expanded (K stuck at 5-6, throughput stalled ~5 M at 64t);
+    // INTERVAL=256 made K oscillate wildly (windows too noisy); 0.15/0.08/4096
+    // gave smooth K growth tracking thread count and the best 64/128-thread
+    // throughput (9.5 / 13.4 M ops/s, median of 5).
     private static final int    MAX_LANES       = 64;
     private static final int    MIN_LANES       = 1;
-    private static final double HIGH_THRESHOLD  = 0.25;  // expand when >25% CAS failures
-    private static final double LOW_THRESHOLD   = 0.05;  // contract when <5% CAS failures
-    private static final long   CHECK_INTERVAL  = 2048;  // ops between elasticity samples
+    private static final double HIGH_THRESHOLD  = 0.15;  // expand when >15% CAS failures
+    private static final double LOW_THRESHOLD   = 0.08;  // contract when <8% CAS failures
+    private static final int    CHECK_INTERVAL  = 4096;  // per-thread ops between samples
 
     // ── State ─────────────────────────────────────────────────────────────────
     @SuppressWarnings("unchecked")
@@ -56,7 +65,11 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
     // Separate counters prevent a single shared counter from becoming a new bottleneck.
     private final AtomicLong enqCounter = new AtomicLong(0);
     private final AtomicLong deqCounter = new AtomicLong(0);
-    private final AtomicLong opCount    = new AtomicLong(0);
+    // Per-thread op count for elasticity sampling. Replaces a global AtomicLong
+    // that was an FAA hot-spot on EVERY operation — the reason ERQ used to run
+    // at less than half of MSQ's single-thread speed.
+    private final ThreadLocal<int[]> opsSinceCheck =
+            ThreadLocal.withInitial(() -> new int[1]);
 
     public ElasticRelaxedQueue() {
         for (int i = 0; i < MAX_LANES; i++) lanes[i] = new Lane<>();
@@ -68,9 +81,12 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
     public void enqueue(T value) {
         while (true) {
             int k   = activeLanes.get();
-            // Round-robin across active lanes; getAndIncrement ensures each
-            // concurrent caller gets a distinct starting index.
-            int idx = (int)(enqCounter.getAndIncrement() % k);
+            // K=1 fast path: lane 0 is the only choice, and the shared FAA
+            // would reintroduce an MSQ-style hot-spot exactly when ERQ is
+            // supposed to behave like a plain MS queue.
+            // K>1: round-robin via getAndIncrement — each concurrent caller
+            // gets a distinct starting index.
+            int idx = (k == 1) ? 0 : (int)(enqCounter.getAndIncrement() % k);
             if (lanes[idx].tryEnqueue(value, monitor)) {
                 maybeAdjustK();
                 return;
@@ -86,7 +102,8 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
         // Use the high-watermark, not activeLanes, so we never skip a lane
         // that had an item written to it just before K contracted.
         int k     = scanHighWater.get();
-        int start = (int)(deqCounter.getAndIncrement() % k);
+        // Same K=1 fast path as enqueue: skip the shared counter.
+        int start = (k == 1) ? 0 : (int)(deqCounter.getAndIncrement() % k);
         for (int i = 0; i < k; i++) {
             T val = lanes[(start + i) % k].tryDequeue(monitor);
             if (val != null) {
@@ -109,7 +126,9 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
     // ── Elasticity control ────────────────────────────────────────────────────
 
     private void maybeAdjustK() {
-        if (opCount.incrementAndGet() % CHECK_INTERVAL != 0) return;
+        int[] c = opsSinceCheck.get();
+        if (++c[0] < CHECK_INTERVAL) return;
+        c[0] = 0;
 
         double failRate = monitor.getFailureRate();
         monitor.reset();
@@ -117,13 +136,17 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
         int k = activeLanes.get();
         if (failRate > HIGH_THRESHOLD && k < MAX_LANES) {
             int newK = k + 1;
-            if (activeLanes.compareAndSet(k, newK)) {
-                // Raise the scan watermark so dequeue() covers the new lane.
-                // CAS loop because two threads could expand simultaneously.
-                int w;
-                do { w = scanHighWater.get(); }
-                while (w < newK && !scanHighWater.compareAndSet(w, newK));
-            }
+            // Raise the scan watermark BEFORE activating the lane. The old
+            // order (activate first) opened a window where an enqueuer could
+            // write to the new lane while dequeue()/isEmpty() did not scan it
+            // yet — items were temporarily invisible, and the diagnostics
+            // could even report FinalK > MaxK. If the activeLanes CAS below
+            // loses, the watermark was raised for nothing; dequeue merely
+            // scans one extra empty lane, which is harmless.
+            int w;
+            do { w = scanHighWater.get(); }
+            while (w < newK && !scanHighWater.compareAndSet(w, newK));
+            activeLanes.compareAndSet(k, newK);
         } else if (failRate < LOW_THRESHOLD && k > MIN_LANES) {
             activeLanes.compareAndSet(k, k - 1);
             // scanHighWater intentionally stays put: dequeue() will keep

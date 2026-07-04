@@ -1,6 +1,6 @@
 
-
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Faithful Java adaptation of the RCQB (Blocking RCQ) algorithm.
@@ -57,6 +57,16 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
     private final Slot[]        slots;
     private final AtomicInteger head;   // dequeue-side counter
     private final AtomicInteger tail;   // enqueue-side counter
+
+    // ── Diagnostics (not part of the paper's algorithm) ──────────────────────
+    // Counts wait(1) calls by dequeuers that exhausted MAX_SPINS — i.e. roughly
+    // the total milliseconds dequeuers spent asleep. Together with the
+    // occupancy sampling in the benchmark this discriminates between the two
+    // candidate explanations for the bimodal throughput seen on both Windows
+    // and the Linux server: time lost sleeping vs. which occupancy mode
+    // (near-empty fast handoff / loaded full-state-machine) the run locked
+    // into. LongAdder, touched only on the sleep path — hot path unaffected.
+    private final LongAdder deqSleepWaits = new LongAdder();
 
     // ── Construction ─────────────────────────────────────────────────────────
 
@@ -150,6 +160,7 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
         s.waiters++;                          // paper line 65: atomicInc(&s→waiters)
         synchronized (s) {
             while (s.state.get() == FREE) {
+                deqSleepWaits.increment();    // diagnostic: ~1 ms about to be slept
                 try { s.wait(1); } catch (InterruptedException e) { break; }
             }
         }
@@ -168,6 +179,14 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
             synchronized (s) { s.notifyAll(); }
         }
     }
+
+    // ── Diagnostics ──────────────────────────────────────────────────────────
+
+    /** Total wait(1) calls by sleeping dequeuers ≈ ms spent asleep. */
+    public long getDequeueSleepWaits() { return deqSleepWaits.sum(); }
+
+    /** Current item count (tail may be read slightly stale; clamped to 0). */
+    public int occupancy() { return Math.max(0, tail.get() - head.get()); }
 
     // ── Slot (Listing 1 struct slot) ─────────────────────────────────────────
 
