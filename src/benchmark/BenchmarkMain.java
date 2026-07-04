@@ -49,10 +49,9 @@ public final class BenchmarkMain {
         for (int n : THREAD_COUNTS) {
             report(runTrials("MSQ ", MichaelScottQueue<Integer>::new, n));
 
-            // RCQB: per trial, throughput / sleep-ms / mean occupancy / failed
-            // head-CAS count. The head-CAS column tests the bimodality
-            // mechanism directly — the slow regime should show far more head
-            // contention than the fast regime.
+            // RCQB is bimodal, so print each trial individually: throughput /
+            // sleep-ms / mean occupancy / failed head-CAS count. The head-CAS
+            // column is the one that separates the fast and slow regimes.
             Trial[] rcqbTrials = runTrials("RCQB", RCQBQueue<Integer>::new, n);
             report(rcqbTrials);
             StringBuilder diag = new StringBuilder(
@@ -159,10 +158,8 @@ public final class BenchmarkMain {
         startGate.countDown();   // release all threads at once
 
         // The timekeeper thread doubles as an occupancy sampler for RCQB
-        // (~10 ms cadence — zero cost on the workers' hot path). The mean
-        // occupancy identifies which mode a trial locked into: near-empty
-        // (fast handoff, cheap null dequeues) or loaded (full slot state
-        // machine on every op).
+        // (~10 ms cadence — zero cost on the workers' hot path), recording the
+        // mean number of items in the ring during the run.
         long occSum = 0, occSamples = 0;
         if (queue instanceof RCQBQueue) {
             RCQBQueue<Integer> rcqb = (RCQBQueue<Integer>) queue;

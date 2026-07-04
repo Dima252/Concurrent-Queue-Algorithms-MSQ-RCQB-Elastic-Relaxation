@@ -58,23 +58,19 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
     private final AtomicInteger head;   // dequeue-side counter
     private final AtomicInteger tail;   // enqueue-side counter
 
-    // ── Diagnostics (not part of the paper's algorithm) ──────────────────────
-    // Counts wait(1) calls by dequeuers that exhausted MAX_SPINS — i.e. roughly
-    // the total milliseconds dequeuers spent asleep. Together with the
-    // occupancy sampling in the benchmark this discriminates between the two
-    // candidate explanations for the bimodal throughput seen on both Windows
-    // and the Linux server: time lost sleeping vs. which occupancy mode
-    // (near-empty fast handoff / loaded full-state-machine) the run locked
-    // into. LongAdder, touched only on the sleep path — hot path unaffected.
+    // ── Diagnostics for the benchmark output (not part of the algorithm) ─────
+    // Number of wait(1) calls by dequeuers that exhausted MAX_SPINS, i.e. an
+    // approximate count of milliseconds spent asleep. Incremented only on the
+    // sleep path, so it does not affect the hot path.
     private final LongAdder deqSleepWaits = new LongAdder();
 
-    // Counts FAILED CAS attempts on head (a dequeuer that lost the race for a
-    // slot index and had to retry). This is the direct test of the leading
-    // bimodality hypothesis: the slow regime ≈ MSQ's single-contended-CAS
-    // ceiling (~4-6 M ops/s), and RCQB's dequeue uses CAS-on-head (OUR
-    // totalization adaptation; the paper uses uncontended FAA). If slow trials
-    // show orders of magnitude more head-CAS failures than fast ones, the slow
-    // regime is our head CAS piling up exactly like MSQ's tail.
+    // Number of FAILED CAS attempts on head — dequeuers that lost the race for a
+    // slot index and had to retry. This measures dequeue-side contention. RCQB's
+    // throughput here is bimodal, and this counter is the discriminator: fast
+    // trials show few head-CAS failures, slow trials show far more. Because the
+    // paper assigns slot indices with an uncontended fetch-and-add and only this
+    // Java port uses a CAS on head (so dequeue() can return null), the slow
+    // regime is a cost of that adaptation, not of the paper's algorithm.
     private final LongAdder headCasFails = new LongAdder();
 
     // ── Construction ─────────────────────────────────────────────────────────
@@ -192,7 +188,7 @@ public class RCQBQueue<T> implements ConcurrentQueue<T> {
         }
     }
 
-    // ── Diagnostics ──────────────────────────────────────────────────────────
+    // ── Diagnostics (read by the benchmark) ───────────────────────────────────
 
     /** Total wait(1) calls by sleeping dequeuers ≈ ms spent asleep. */
     public long getDequeueSleepWaits() { return deqSleepWaits.sum(); }

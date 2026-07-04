@@ -17,9 +17,9 @@ public final class ContentionMonitor {
     private static final int FLUSH_INTERVAL = 64;
 
     // Index 0 = successes, index 1 = failures, index 2 = ops since last flush.
-    // One array in ONE ThreadLocal: record() runs on the hot path of every CAS,
-    // and a ThreadLocal lookup is its dominant cost — two lookups (the previous
-    // design kept the flush counter in a separate ThreadLocal) doubled it.
+    // All three live in a single ThreadLocal array: record() runs on the hot
+    // path of every CAS, where the ThreadLocal lookup is the dominant cost, so
+    // keeping it to one lookup per call matters.
     private final ThreadLocal<long[]> localWindow =
             ThreadLocal.withInitial(() -> new long[3]);
 

@@ -8,8 +8,9 @@ import java.util.concurrent.atomic.LongAdder;
  *
  * <h2>Core idea</h2>
  * Maintains an array of {@code MAX_LANES} MS-queue lanes, but only the first
- * {@code activeLanes} (= K) are live at any time. Threads pick a lane in
- * round-robin order via an atomic counter.
+ * {@code activeLanes} (= K) are live at any time. Each operation picks one of
+ * the live lanes; at K &gt; 1 the choice is made with {@link ThreadLocalRandom}
+ * so lane selection adds no shared-memory contention of its own.
  *
  * <ul>
  *   <li><b>K = 1</b>: all operations funnel through a single lane → identical to
@@ -41,11 +42,10 @@ import java.util.concurrent.atomic.LongAdder;
 public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
 
     // ── Tuning knobs ──────────────────────────────────────────────────────────
-    // Values fixed by the 2026-07 server tuning sweep (5 configurations):
-    // 0.30/1024 under-expanded (K stuck at 5-6, throughput stalled ~5 M at 64t);
-    // INTERVAL=256 made K oscillate wildly (windows too noisy); 0.15/0.08/4096
-    // gave smooth K growth tracking thread count and the best 64/128-thread
-    // throughput (9.5 / 13.4 M ops/s, median of 5).
+    // Chosen by a tuning sweep. A high expansion threshold (e.g. 0.30) makes K
+    // grow too slowly to relieve contention; a short sampling interval (e.g.
+    // 256 ops) makes K oscillate because each window is dominated by noise.
+    // 0.15 / 0.08 / 4096 gives smooth K growth that tracks the thread count.
     private static final int    MAX_LANES       = 64;
     private static final int    MIN_LANES       = 1;
     private static final double HIGH_THRESHOLD  = 0.15;  // expand when >15% CAS failures
@@ -62,16 +62,18 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
     private final AtomicInteger scanHighWater = new AtomicInteger(MIN_LANES);
     private final ContentionMonitor monitor   = new ContentionMonitor();
 
-    // Per-thread op count for elasticity sampling. Replaces a global AtomicLong
-    // that was an FAA hot-spot on EVERY operation — the reason ERQ used to run
-    // at less than half of MSQ's single-thread speed.
+    // Per-thread counter that triggers the elasticity check. It is thread-local,
+    // not a single shared counter, because a shared counter incremented on every
+    // operation would itself be a contention hot-spot — the exact cost ERQ sets
+    // out to avoid. Globally this still averages one check per CHECK_INTERVAL ops.
     private final ThreadLocal<int[]> opsSinceCheck =
             ThreadLocal.withInitial(() -> new int[1]);
 
-    // Diagnostics (report evidence, not part of the algorithm): total dequeue
-    // calls and total lanes scanned across them, so we can report the mean scan
-    // depth per dequeue. If the queue is not near-empty this stays close to 1
-    // and the O(K) scan is a non-issue; if it climbs with K it is a real cost.
+    // Diagnostics for the benchmark output (not used by the algorithm itself):
+    // total dequeue calls and total lanes examined across them. Their ratio is
+    // the mean scan depth — how many lanes a dequeue inspects before finding an
+    // item. It stays near 1 when lanes hold items and would approach K only if
+    // the queue ran near-empty, so it shows whether the O(K) scan matters here.
     private final LongAdder deqCalls    = new LongAdder();
     private final LongAdder lanesProbed = new LongAdder();
 
@@ -85,12 +87,10 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
     public void enqueue(T value) {
         while (true) {
             int k = activeLanes.get();
-            // K=1 fast path: lane 0 is the only choice. K>1: pick a lane with
-            // ThreadLocalRandom, NOT a shared getAndIncrement. The old shared
-            // counter was a contended FAA on every enqueue — a fresh single
-            // hot-spot that re-created the exact MSQ bottleneck ERQ exists to
-            // spread. A random index spreads load just as well with zero shared
-            // state, and on a CAS collision the next iteration simply re-draws.
+            // At K=1 lane 0 is the only choice. At K>1 pick a random lane: this
+            // spreads enqueues across lanes without any shared counter, so lane
+            // selection never becomes a contention point of its own. If the
+            // chosen lane's CAS loses, the loop simply re-draws another lane.
             int idx = (k == 1) ? 0 : ThreadLocalRandom.current().nextInt(k);
             if (lanes[idx].tryEnqueue(value, monitor)) {
                 maybeAdjustK();
@@ -104,20 +104,20 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
         // Use the high-watermark, not activeLanes, so we never skip a lane
         // that had an item written to it just before K contracted.
         int k     = scanHighWater.get();
-        // Random start (K>1), same reasoning as enqueue: no shared counter.
+        // Random start lane at K>1, same reasoning as enqueue: no shared counter.
         int start = (k == 1) ? 0 : ThreadLocalRandom.current().nextInt(k);
         for (int i = 0; i < k; i++) {
             T val = lanes[(start + i) % k].tryDequeue(monitor);
             if (val != null) {
                 deqCalls.increment();
-                lanesProbed.add(i + 1);   // lanes touched before finding an item
+                lanesProbed.add(i + 1);   // lanes examined before finding an item
                 maybeAdjustK();
                 return val;
             }
         }
         deqCalls.increment();
-        lanesProbed.add(k);               // scanned all k, found nothing
-        return null; // all lanes empty
+        lanesProbed.add(k);               // examined all k lanes, all empty
+        return null;
     }
 
     @Override
@@ -142,13 +142,12 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
         int k = activeLanes.get();
         if (failRate > HIGH_THRESHOLD && k < MAX_LANES) {
             int newK = k + 1;
-            // Raise the scan watermark BEFORE activating the lane. The old
-            // order (activate first) opened a window where an enqueuer could
-            // write to the new lane while dequeue()/isEmpty() did not scan it
-            // yet — items were temporarily invisible, and the diagnostics
-            // could even report FinalK > MaxK. If the activeLanes CAS below
-            // loses, the watermark was raised for nothing; dequeue merely
-            // scans one extra empty lane, which is harmless.
+            // Raise the scan watermark BEFORE activating the new lane, so that
+            // as soon as an enqueuer can write to lane newK-1, dequeue() and
+            // isEmpty() already scan it. The reverse order would leave a brief
+            // window in which an item sits in a lane no reader inspects. If the
+            // activeLanes CAS below loses, the watermark was raised needlessly
+            // and dequeue simply scans one extra empty lane — harmless.
             int w;
             do { w = scanHighWater.get(); }
             while (w < newK && !scanHighWater.compareAndSet(w, newK));
@@ -161,18 +160,15 @@ public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
         }
     }
 
-    // ── Diagnostics ───────────────────────────────────────────────────────────
+    // ── Diagnostics (read by the benchmark) ───────────────────────────────────
 
-    /** Current number of active lanes (K). Useful for logging and assertions. */
-    public int    getActiveLanes() { return activeLanes.get(); }
+    /** Current number of active lanes, K. */
+    public int getActiveLanes() { return activeLanes.get(); }
 
-    /** Maximum number of lanes used. Useful for logging and assertions. */
+    /** Highest K ever reached during the run (the scan high-watermark). */
     public int getMaxLanesReached() { return scanHighWater.get(); }
 
-    /** Snapshot of the current CAS failure rate [0.0, 1.0]. */
-    public double getFailureRate() { return monitor.getFailureRate(); }
-
-    /** Mean lanes touched per dequeue call. ~1 = O(1); near K = O(K) scan cost. */
+    /** Mean lanes examined per dequeue. ~1 means the up-to-K scan costs little. */
     public double getAvgScanDepth() {
         long calls = deqCalls.sum();
         return calls == 0 ? 0.0 : (double) lanesProbed.sum() / calls;

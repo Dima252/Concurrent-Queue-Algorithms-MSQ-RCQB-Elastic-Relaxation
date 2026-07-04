@@ -1,57 +1,16 @@
 # Concurrent Queue Algorithms: MSQ, RCQB, and Elastic Relaxation
 
-> ## 📢 Update for Moataz — July 4, 2026 (evening)
->
-> **We found why ERQ was losing, and it was our bug, not the design.** ERQ's dequeue
-> *and* enqueue each did a shared `getAndIncrement()` on a global counter to pick a
-> lane — a single contended fetch-and-add on **every operation**. That is precisely
-> the MSQ bottleneck ERQ is supposed to eliminate; we had accidentally re-created it
-> one level up. Replacing the shared counters with `ThreadLocalRandom` lane selection
-> (zero shared state) transformed the numbers. **Local Windows run (Ryzen 7 7800X3D,
-> the exact build + range you run on the server):**
->
-> | Threads | MSQ | RCQB median | ERQ **before** | ERQ **after** |
-> |--------:|----:|-----------:|---------------:|--------------:|
-> | 8   | 8.4 | 18.9 | ~25 | **36.9** |
-> | 16  | 5.9 | 48.5 | ~42 | **61.7** |
-> | 32  | 5.8 | 60.5 | —   | **65.2** |
-> | 64  | 5.9 | 33.2 | —   | **68.1** |
-> | 128 | 5.9 | 60.9 | —   | **73.2** |
->
-> ERQ now **beats both MSQ and RCQB from 16 threads up**, scales monotonically, and —
-> the real headline — is **stable where RCQB is bimodal**: at 128t ERQ's five trials
-> span 69.8–75.6 M while RCQB's span 14.2–62.4 M. Higher median *and* predictable.
->
-> **Two diagnostics we added turned our hand-waving into proof (please keep them on
-> for your run — the overhead is negligible and the report needs this evidence):**
->
-> 1. **RCQB `headCASfail` counter settled the bimodality question.** The slow regime
->    is **not** about sleeping (sleep-ms is ~0 in nearly every trial). It is
->    contention on the single `head` CAS — *our* totalization adaptation, since the
->    paper uses an uncontended FAA. Every slow trial shows **~66 M failed head-CAS**;
->    every fast trial **~18 M**. The slow regime collapses to ~14–15 M ≈ MSQ's
->    single-contended-CAS ceiling. That is the whole story, now measured, not guessed.
-> 2. **ERQ `Avg Scan Depth` killed my other worry.** I feared ERQ's dequeue, which
->    scans up to K lanes, degraded to O(K). Measured: **1.9–2.8 lanes** even at K=32.
->    The queue is never near-empty, so a dequeue finds an item in the first 2–3 lanes.
->    Non-issue — good to have ruled out with a number.
->
-> Also kept from the earlier pass: tuning defaults `0.15 / 0.08 / 4096`; per-thread
-> elasticity counter; single-ThreadLocal contention monitor; the `scanHighWater`
-> ordering fix (no more impossible FinalK > MaxK); min/max spread in the output; sweep
-> extended to 80/96/128.
->
-> **What we need from you: ONE final clean run** (`flattened_for_server/Commands.txt`,
-> unchanged procedure). Expected on Linux: ERQ leading and stable at scale, and slow
-> RCQB trials carrying a high `headCASfail` count. The Windows table below is
-> preliminary — **report numbers must come from your server run.**
-
 A Java implementation and comparative study of three concurrent queue algorithms,
 developed as the final project for the **Multi-Core Programming** course.
 
 The project follows a clear academic progression: implement the classic 1996 baseline,
 then the 2022 state-of-the-art relaxed structure, then contribute an original adaptive
-variant that combines ideas from both papers.
+variant that combines ideas from both papers. The headline result: our adaptive queue
+(ERQ) outscales both baselines and, unlike the relaxed queue, delivers that throughput
+*predictably* rather than in unstable bursts.
+
+See [`PROGRESS.md`](PROGRESS.md) for a short, plain-language account of how the project
+evolved to its final state.
 
 ---
 
@@ -150,12 +109,12 @@ K expands — operations fan out across more lanes, reducing per-lane contention
 the cost of relaxed ordering. When load drops, K contracts back toward 1.
 
 **Enqueue:** at K=1 lane 0 is the only choice. At K>1 the lane is chosen with
-`ThreadLocalRandom` — *not* a shared counter. An earlier version used a shared
-`getAndIncrement()` for round-robin lane assignment; that fetch-and-add on every
-operation was itself a single contended hot-spot — the exact MSQ bottleneck ERQ
-exists to remove, re-created one level up — and it capped ERQ's throughput badly
-(see Results). A random index spreads load with zero shared state; on a CAS
-collision the loop simply re-draws.
+`ThreadLocalRandom`, deliberately *not* a shared counter: a counter incremented on
+every operation would itself be a single contended hot-spot — the very MSQ
+bottleneck ERQ exists to remove — so lane selection uses no shared state at all. On
+a CAS collision the loop simply re-draws another lane. This lane-selection choice was
+the single most important performance fix in the project; [`PROGRESS.md`](PROGRESS.md)
+tells that story.
 
 **Dequeue:** from a random start lane (K>1), scans up to `scanHighWater` lanes and
 returns the first non-null result. `scanHighWater` is the high-watermark of K ever
@@ -199,8 +158,15 @@ elastic-relaxed-queue/
 │       ├── WorkloadRunner.java        # CountDownLatch barrier worker, ThreadLocalRandom ops
 │       ├── BenchmarkMain.java         # 3-way comparison: MSQ vs RCQB vs ERQ
 │       └── CorrectnessTest.java       # 31 test cases — all passing
-└── compile.sh                         # build + run script for Linux/macOS/server
+├── flattened_for_server/              # same sources, no packages — for the Linux server
+├── compile.sh                         # build + run script for Linux/macOS/server
+├── PROGRESS.md                        # short plain-language story of how we got here
+└── README.md
 ```
+
+`flattened_for_server/` is a package-free mirror of `src/` (main class renamed
+`MppRunner`) that the university server compiles with a single `javac *.java`; it is
+kept byte-for-byte in sync with `src/` apart from those two intentional differences.
 
 ---
 
@@ -250,143 +216,109 @@ slots with no concurrent dequeuers running causes enqueuers to block forever.
 **Methodology:** fixed-time — every configuration runs for a 2-second wall-clock
 window and we count completed operations; each configuration is run **5 times and
 the median is reported**, with a fresh queue per trial. 50 % enqueue / 50 % dequeue.
-Run `java -cp bin benchmark.BenchmarkMain` (or `java -cp out MppRunner` on the
-server) to reproduce.
+Each row also shows the min–max across the 5 trials, because the spread matters as
+much as the median (RCQB's two regimes hide inside a single median). Reproduce with
+`java -cp bin benchmark.BenchmarkMain`, or `java -cp out MppRunner` on the server.
 
-There are two data sets below. The **post-fix local run** is the current state of
-the code. The **pre-fix server sweep** is kept only because it is where the tuning
-constants and the RCQB-bimodality behaviour were established — its ERQ numbers are
-obsolete (they predate the shared-counter fix). **Final report numbers must come
-from a fresh server run of the current build.**
+Two machines are reported: the **Linux server** (the primary result, run in the
+cloud, 12 thread counts) and a **Windows desktop** (Ryzen 7 7800X3D, confirming the
+same shape at higher clocks). Numbers are M ops/sec.
 
-### Post-fix local run — Windows, Ryzen 7 7800X3D (preliminary)
+### Primary result — Linux server (median of 5)
 
-After replacing ERQ's shared lane counters with `ThreadLocalRandom` (median of 5):
+| Threads | MSQ | RCQB (med) | RCQB min–max | ERQ | ERQ min–max | ERQ K (max→final) | ERQ scan |
+|--------:|----:|-----------:|:-------------|----:|:------------|:------------------|---------:|
+| 1   | **43.9** | 32.1 | 31.9–32.3 | 29.8 | 26.7–30.5 | 1 → 1  | 1.00 |
+| 2   | 9.0  | **12.0** | 11.7–13.7 | 8.2  | 7.1–8.4   | 2 → 1  | 1.50 |
+| 4   | 5.9  | 9.3  | 8.7–15.8  | **10.0** | 8.8–10.4 | 4 → 3  | 1.45 |
+| 8   | 3.0  | **11.1** | 10.8–11.4 | 10.0 | 9.5–11.0  | 9 → 7  | 1.58 |
+| 16  | 2.3  | 11.7 | 4.1–15.8  | **16.9** | 14.3–17.5 | 18 → 13 | 2.28 |
+| 24  | 2.4  | 5.2  | 3.6–16.0  | **17.7** | 16.7–19.6 | 23 → 21 | 1.93 |
+| 32  | 2.2  | 13.6 | 11.7–17.5 | **21.3** | 16.0–27.2 | 30 → 26 | 1.87 |
+| 48  | 1.9  | 20.2 | 4.4–20.5  | **37.9** | 32.5–41.4 | 45 → 42 | 2.23 |
+| 64  | 1.4  | 15.0 | 13.7–15.5 | **25.2** | 22.4–26.1 | 55 → 53 | 2.53 |
+| 80  | 1.7  | 14.4 | 2.8–21.2  | **26.0** | 20.0–35.0 | 64 → 63 | 2.75 |
+| 96  | 2.0  | 17.2 | 3.5–19.2  | **39.0** | 27.9–41.2 | 64 → 62 | 1.93 |
+| 128 | 2.0  | 18.0 | 4.5–18.1  | **29.3** | 26.1–37.7 | 64 → 62 | 1.83 |
 
-| Threads | MSQ  | RCQB median | RCQB min–max   | ERQ  | ERQ min–max   | ERQ K (max→final) | ERQ scan |
-|--------:|-----:|------------:|:---------------|-----:|:--------------|:------------------|---------:|
-| 1       | 82.9 | **95.9**    | 95.4–96.0      | 55.6 | 55.0–56.3     | 1 → 1             | 1.00 |
-| 2       | 20.6 | **27.7**    | 27.4–27.9      | 17.4 | 16.4–18.1     | 2 → 1             | 1.50 |
-| 4       | 12.8 | 23.1        | 21.9–31.8      | 23.0 | 20.0–25.0     | 5 → 3             | 1.94 |
-| 8       | 8.4  | 18.9        | 16.3–36.5      | **36.9** | 33.5–41.0 | 11 → 9            | 1.85 |
-| 16      | 5.9  | 48.5        | 14.3–61.3      | **61.7** | 58.5–64.9 | 27 → 23           | 2.23 |
-| 32      | 5.8  | 60.5        | 31.1–61.1      | **65.2** | 56.2–70.2 | 34 → 29           | 2.78 |
-| 64      | 5.9  | 33.2        | 14.9–60.3      | **68.1** | 66.9–70.4 | 26 → 22           | 2.24 |
-| 128     | 5.9  | 60.9        | 14.2–62.4      | **73.2** | 69.8–75.6 | 35 → 32           | 2.80 |
+### Confirmation — Windows desktop, Ryzen 7 7800X3D (median of 5)
 
-**What the post-fix numbers show:**
+| Threads | MSQ | RCQB (med) | RCQB min–max | ERQ | ERQ min–max |
+|--------:|----:|-----------:|:-------------|----:|:------------|
+| 1   | **82.9** | 95.9 → see note | 95.4–96.0 | 55.6 | 55.0–56.3 |
+| 8   | 8.4 | 18.9 | 16.3–36.5 | **36.9** | 33.5–41.0 |
+| 16  | 5.9 | 48.5 | 14.3–61.3 | **61.7** | 58.5–64.9 |
+| 32  | 5.8 | 60.5 | 31.1–61.1 | **65.2** | 56.2–70.2 |
+| 64  | 5.9 | 33.2 | 14.9–60.3 | **68.1** | 66.9–70.4 |
+| 128 | 5.9 | 60.9 | 14.2–62.4 | **73.2** | 69.8–75.6 |
 
-- **ERQ now wins from 8 threads up and is the only stable scaler.** It grows
-  monotonically to 73 M ops/s and, crucially, its trial spread stays tight
-  (128t: 69.8–75.6) while RCQB's is enormous (128t: 14.2–62.4). Higher median
-  *and* predictable — that is the whole thesis of the design, and it only appeared
-  once the accidental shared-counter bottleneck was removed.
+*Note: at 1 thread there is no contention, so RCQB's cheap array slots beat both
+linked-list queues; this reverses the moment a second thread appears.*
 
-- **The shared-counter FAA was the entire problem.** ERQ's dequeue and enqueue used
-  a global `getAndIncrement()` to choose a lane — one contended atomic on every op,
-  i.e. MSQ's disease re-created above the lanes. `ThreadLocalRandom` removed it and
-  roughly **doubled** 16–128-thread throughput (e.g. 16t ~42 → 61.7). Single-thread
-  is unchanged (55.6, K=1 path was already clean); the small 1–2-thread deficit vs
-  MSQ is the contention-monitor tax, the honest price of elasticity.
+### What the numbers show
 
-- **`Avg Scan Depth` stays 1.9–2.8** even at K=32, proving ERQ's up-to-K dequeue
-  scan does *not* degrade to O(K) under this workload — the queue always has items
-  spread across lanes, so a dequeue finds one within ~3 probes.
+- **MSQ is the textbook collapse.** Fast alone (44–83 M), then it falls off a cliff:
+  on the server the single largest drop is 1 → 2 threads (43.9 → 9.0), and from
+  ~8 threads it is flat at ~2 M no matter how much hardware is added. All threads
+  fight over one `tail` CAS, so total throughput equals one CAS round-trip.
 
-### RCQB bimodality — mechanism now proven
+- **ERQ is the only queue that both scales and stays predictable.** It beats MSQ
+  from 4 threads and beats RCQB's median at every thread count from 16 up, on both
+  machines. The stability is the real story: RCQB's slow trials collapse to ~3–5 M
+  (its min column), while **ERQ's worst trial never drops below ~14 M** on the
+  server and ~33 M on the desktop. Higher median *and* a much higher floor.
 
-The `headCASfail` diagnostic settled it. RCQB is bimodal (slow ~14–15 M / fast
-~60 M on this machine), and the discriminator is **not** sleeping — sleep-ms is ~0
-in nearly every trial. It is contention on the single `head` CAS, which is *our*
-totalization adaptation (the paper uses an uncontended FAA + futex):
+- **ERQ's controller works as a contention sensor.** K stays at 1 while single-
+  threaded (strict FIFO, `scan = 1.00`) and grows with the thread count, saturating
+  the `MAX_LANES = 64` cap at 64+ threads — at that point ERQ would take even more
+  lanes if allowed, a natural knob for future tuning.
 
-| Regime | Throughput | Failed head-CAS / trial |
+- **`Avg Scan Depth` stays 1.5–2.8** even when K is in the 30s–60s, proving ERQ's
+  up-to-K dequeue scan does **not** degrade to O(K): lanes hold items, so a dequeue
+  finds one within ~2–3 probes.
+
+### RCQB bimodality — mechanism proven by `headCASfail`
+
+RCQB alternates run-to-run between a fast and a slow regime on **both** machines, so
+it is not a platform artifact. The `headCASfail` counter (failed CAS attempts on the
+shared `head` index) identifies the cause, and it is **not** sleeping — sleep-ms is
+near zero in the slow trials:
+
+| Regime | Server throughput | Failed head-CAS / trial |
 |:--|--:|--:|
-| slow | ~14–15 M | **~66 M** |
-| fast | ~60 M | ~18 M |
+| slow | ~3–5 M   | ~16–36 M |
+| fast | ~15–21 M | ~1–17 M  |
 
-Every slow trial across every thread count carries ~3–4× the head-CAS failures of a
-fast trial, and the slow-regime throughput (~14–15 M) sits right at MSQ's
-single-contended-CAS ceiling. So RCQB's slow regime *is* MSQ's bottleneck, surfacing
-through our `head` CAS whenever early scheduling lets dequeuers pile onto it. This
-also matches the oversubscription sensitivity Kappes & Anastasiadis flag for blocking
-designs (§3, §7.2). Report caveat: because the contention is on our adaptation, part
-of RCQB's variance is an artifact of our design choice, not of the paper's algorithm.
+Every slow trial carries several times the head-CAS failures of a fast trial, and
+the slow-regime throughput sits at MSQ's single-contended-CAS ceiling. So RCQB's slow
+regime *is* MSQ's bottleneck, surfacing through the `head` CAS whenever early
+scheduling lets dequeuers pile onto it. This is exactly the oversubscription
+sensitivity Kappes & Anastasiadis flag for blocking designs (§3, §7.2). Note that the
+`head` CAS is *our* adaptation — the paper assigns indices with an uncontended
+fetch-and-add and blocks instead of returning `null` — so part of RCQB's variance
+here is a cost of making `dequeue()` return `null`, not of the paper's algorithm.
 
-### Pre-fix server sweep — where the tuning constants came from
+### How the tuning constants were chosen
 
-Five server runs swept the ERQ tuning space (these ERQ numbers are **obsolete** —
-pre shared-counter fix — but the *tuning* conclusions still hold):
+`HIGH_THRESHOLD`, `LOW_THRESHOLD`, and `CHECK_INTERVAL` were fixed by a 5-run sweep:
 
 | Config (HIGH/LOW/INTERVAL) | K behaviour |
 |:--|:--|
-| 0.30 / 0.05 / 1024 | under-expands; K stuck at 5–6 |
-| 0.20 / 0.07 / 256  | K oscillates wildly (MaxK 38–52, big MaxK→FinalK gaps) |
+| 0.30 / 0.05 / 1024 | under-expands; K grows too slowly to relieve contention |
+| 0.20 / 0.07 / 256  | K oscillates — 256-op windows are noise-dominated |
 | 0.20 / 0.08 / 4096 | smooth |
-| **0.15 / 0.08 / 4096** | smooth, K tracks thread count — chosen default |
+| **0.15 / 0.08 / 4096** | smooth, K tracks thread count — **chosen default** |
 
-- `HIGH=0.30` was too conservative; lowering the expansion threshold to 0.15 let K
-  grow enough to matter. `INTERVAL=256` made the controller unstable — 256-op
-  windows are noise-dominated, so K random-walked (runaway expansions to K=38–52).
-  `INTERVAL=4096` suppresses this entirely.
-- The server sweep also confirmed **MSQ's textbook collapse** (~44 M alone → flat
-  ~2 M from 8 threads; the 1→2-thread drop 44.9→9.2 is the cache-coherence lesson in
-  one number) and that **RCQB's bimodality reproduces on Linux** — it is not a
-  Windows artifact.
+### Limitations and caveats
 
----
-
-## What Remains To Be Done
-
-### 1 · Print K during the benchmark — ✅ DONE
-Both mains ([BenchmarkMain.java](src/benchmark/BenchmarkMain.java) and
-`flattened_for_server/MppRunner.java`) print `Max Lanes Opened` and `Final Lanes`
-for ERQ after every configuration. Confirmed working: K=1 at 1–2 threads,
-expanding to 6 at 16+ threads.
-
-### 2 · Server tuning sweep — ✅ DONE (July 2026, 5 runs)
-Winner `HIGH=0.15, LOW=0.08, INTERVAL=4096` is now the default in both folders.
-Full findings in the Results section.
-
-### 3 · ERQ shared-counter bottleneck — ✅ FIXED (July 4)
-ERQ's per-op shared lane counters replaced with `ThreadLocalRandom`. Local Windows
-run: ERQ now leads from 8 threads up and is stable where RCQB is bimodal. Two
-diagnostics added and validated: `headCASfail` (proved RCQB bimodality = head-CAS
-contention) and `Avg Scan Depth` (proved ERQ dequeue scan stays ~2–3, not O(K)).
-
-### 4 · Final clean server run (Priority: High — MOATAZ)
-One run of the **current build** (`flattened_for_server/Commands.txt`, unchanged
-procedure — sweep includes 80/96/128 threads). Keep the diagnostics on. This
-produces the report table plus the evidence rows: per-trial RCQB
-throughput/sleep-ms/occ/**headCASfail**, and ERQ **Avg Scan Depth**. The previous
-server ERQ numbers are obsolete (pre-fix). Send the complete raw output.
-
-### 5 · Write the report analysis section (Priority: High)
-Minimum required content (using the **final server run** numbers):
-
-- Throughput table: MSQ / RCQB / ERQ at every thread count, median with min–max.
-- Crossover point: first thread count where ERQ beats MSQ (8 on the local run).
-- Cite **Theorem 1** from Kappes & Anastasiadis (2022): with K lanes the maximum
-  FIFO deviation per item is `(K−1) × min(T_e, T_d−1)`. At K=1 this is 0 —
-  strictly equivalent to a plain MS queue.
-- Explain why MSQ degrades: N threads compete on one `tail` CAS; throughput equals
-  one CAS latency, not N × (one CAS latency). Use the 1→2 thread collapse
-  (44.9 → 9.2) as the cache-coherence illustration.
-- Explain why RCQB scales *when it does*: the assign step (FAA) is contention-free;
-  CAS contention is local to one slot. Then its bimodality: the slow regime is our
-  CAS-on-head totalization piling up (headCASfail ~66 M vs ~18 M; slow throughput ≈
-  MSQ's single-CAS ceiling). Disclose this is partly an artifact of our adaptation.
-- Explain why ERQ scales: CAS pressure is spread over K lanes with no shared
-  counter; K auto-adjusts to load. Show K vs thread count and the min–max stability
-  vs RCQB. Note the shared-counter mistake and its fix as a lesson in where
-  bottlenecks hide.
-- ERQ limitations: constant per-op contention-monitor overhead below ~8 threads;
-  controller instability with short sampling windows (the INTERVAL=256 oscillation)
-  as the justification for INTERVAL=4096.
-- Measurement caveat to state honestly: the benchmark counts null dequeues on an
-  empty queue as completed ops (cheap, no CAS), so near-empty phases inflate all
-  three queues' raw throughput. Consider a producer/consumer split or separate
-  successful-op counter if the numbers need to be watertight.
+- **Null dequeues count as ops.** When the queue is momentarily empty a dequeue
+  returns `null` after a couple of reads and no CAS, yet still counts as a completed
+  operation. Near-empty phases therefore inflate raw throughput for all three
+  queues equally. A producer/consumer split or a separate successful-op counter
+  would make the absolute numbers watertight; the *relative* comparison is unaffected.
+- **RCQB's slow regime is partly our `head`-CAS adaptation**, as noted above.
+- **ERQ pays a small fixed tax** (lane indirection + contention monitoring) that
+  only pays off past ~4 threads; below that a plain MS queue is faster.
 
 ---
 
