@@ -183,8 +183,10 @@ java -cp bin benchmark.BenchmarkMain
 # 31 correctness tests (no items lost or duplicated)
 java -cp bin benchmark.CorrectnessTest
 
-# One-shot build + benchmark on Linux/macOS/university server
-bash compile.sh run
+# To run on the server
+cd flattened_for_server
+javac --release=8 -d out *.java
+\\ Then move all the compiled .class files to the server
 ```
 
 > If you get `OutOfMemoryError` at 512–1024 threads, add `-Xss256k` to reduce
