@@ -219,8 +219,7 @@ slots with no concurrent dequeuers running causes enqueuers to block forever.
 window and we count completed operations; each configuration is run **5 times and
 the median is reported**, with a fresh queue per trial. 50 % enqueue / 50 % dequeue.
 Each row also shows the min–max across the 5 trials, because the spread matters as
-much as the median (RCQB's two regimes hide inside a single median). Reproduce with
-`java -cp bin benchmark.BenchmarkMain`, or `java -cp out MppRunner` on the server.
+much as the median (RCQB's two regimes hide inside a single median).
 
 Two machines are reported: the **Linux server** (the primary result, run in the
 cloud, 12 thread counts) and a **Windows desktop** (Ryzen 7 7800X3D, confirming the
