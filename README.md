@@ -120,9 +120,10 @@ tells that story.
 returns the first non-null result. `scanHighWater` is the high-watermark of K ever
 reached and never decreases — this prevents a correctness bug where K contracts
 after an item is written to a now-inactive lane, silently losing that item. The
-scan is O(K) in the worst case, but measured mean scan depth stays ~2–3 lanes even
-at K=32 (the queue is never near-empty under this workload), so it is not a cost
-in practice.
+scan is O(K) in the worst case, but under the balanced 50/50 workload the measured
+mean scan depth stays ~2–3 lanes even at K=32 (lanes hold items, so a dequeue finds
+one in the first few probes). It does degrade toward O(K) under a dequeue-heavy
+workload, where lanes run near-empty — a real limitation of the design.
 
 **ContentionMonitor:** thread-local `long[]` arrays accumulate CAS outcomes with
 zero shared-memory writes per record. Every 64 ops the local window flushes to a

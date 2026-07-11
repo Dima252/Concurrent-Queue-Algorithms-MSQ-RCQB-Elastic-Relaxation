@@ -17,7 +17,8 @@ import java.util.concurrent.atomic.LongAdder;
  *   <li><b>K = 1</b>: all operations funnel through a single lane → identical to
  *       a plain MS queue with strict FIFO ordering.</li>
  *   <li><b>K &gt; 1</b>: enqueues and dequeues spread across K lanes, reducing
- *       per-lane CAS contention at the cost of relaxed (K-bounded) FIFO order.</li>
+ *       per-lane CAS contention at the cost of relaxed FIFO order whose expected
+ *       deviation grows with K.</li>
  * </ul>
  *
  * <h2>Elasticity</h2>
@@ -34,11 +35,16 @@ import java.util.concurrent.atomic.LongAdder;
  * The adjustment uses a single CAS on {@code activeLanes}, so concurrent
  * samplers cannot stampede K in one step.
  *
- * <h2>Relaxation bound</h2>
- * Analogous to Kappes & Anastasiadis (2022) Theorem 1: with K lanes and T
- * enqueuer threads, an item can be dequeued at most
- * {@code (K-1) * min(T_e, T_d - 1)} positions out of strict FIFO order.
- * When K=1 this is 0 — strict FIFO.
+ * <h2>Ordering guarantee</h2>
+ * Within a single lane ordering is strict FIFO (each lane is a plain MS queue,
+ * proven linearizable by Michael &amp; Scott 1996), so reordering can only ever
+ * occur ACROSS lanes. Unlike Kappes &amp; Anastasiadis (2022), whose round-robin
+ * fetch-and-add assignment yields a deterministic worst-case bound (their
+ * Theorem 1), ERQ picks lanes at random and therefore has NO hard worst-case
+ * bound — an adversarial scheduler could keep favouring a subset of lanes.
+ * Instead the guarantee is probabilistic: under a fair scheduler and balanced
+ * load the expected out-of-order (rank) error of an item is O(K), independent of
+ * how many items are queued (see Proof.pdf). At K=1 it is exactly 0 — strict FIFO.
  */
 public class ElasticRelaxedQueue<T> implements ConcurrentQueue<T> {
 
