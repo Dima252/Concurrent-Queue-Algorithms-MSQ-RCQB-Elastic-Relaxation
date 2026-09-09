@@ -3,3 +3,6 @@ bin/
 out/
 flattened_for_server/out/
 *.class
+
+# Figure intermediates — regenerate with assets/make-figures.js
+assets/*.html
