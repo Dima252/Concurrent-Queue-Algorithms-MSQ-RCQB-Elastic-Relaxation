@@ -160,6 +160,10 @@ elastic-relaxed-queue/
 │       ├── BenchmarkMain.java         # 3-way comparison: MSQ vs RCQB vs ERQ
 │       └── CorrectnessTest.java       # 31 test cases — all passing
 ├── flattened_for_server/              # same sources, no packages — for the Linux server
+├── assets/
+│   ├── make-figures.js                # regenerates both figures from the numbers below
+│   ├── throughput-vs-threads.png      # the results figure used in this README
+│   └── erq-linkedin-hero.png          # portrait poster of the same result, for slides
 ├── compile.sh                         # build + run script for Linux/macOS/server
 ├── PROGRESS.md                        # short plain-language story of how we got here
 └── README.md
@@ -168,6 +172,11 @@ elastic-relaxed-queue/
 `flattened_for_server/` is a package-free mirror of `src/` (main class renamed
 `MppRunner`) that the university server compiles with a single `javac *.java`; it is
 kept byte-for-byte in sync with `src/` apart from those two intentional differences.
+
+`assets/` holds the two figures and the script that draws them. Both are generated
+from one copy of the Linux-server numbers embedded in `assets/make-figures.js`, so
+the figures and the tables below cannot drift apart; re-run it (the commands are in
+the script header) after any new benchmark run.
 
 ---
 
@@ -225,6 +234,8 @@ much as the median (RCQB's two regimes hide inside a single median).
 Two machines are reported: the **Linux server** (the primary result, run in the
 cloud, 12 thread counts) and a **Windows desktop** (Ryzen 7 7800X3D, confirming the
 same shape at higher clocks). Numbers are M ops/sec.
+
+![Throughput versus thread count. MSQ starts highest at one thread and collapses to about 2 M ops/sec from eight threads on. RCQB rises but its min-max band swings widely between trials. ERQ has the highest median from 16 threads up and the narrowest band.](assets/throughput-vs-threads.png)
 
 ### Primary result — Linux server (median of 5)
 
